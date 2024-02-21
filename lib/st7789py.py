@@ -768,7 +768,7 @@ class ST7789:
         """
         self._write(_ST7789_VSCSAD, struct.pack(">H", vssa))
 
-    def scroll(xstep,ystep):
+    def scroll(self,xstep,ystep):
         """
         Shift the contents of the FrameBuffer by the given vector.
         This may leave a footprint of the previous colors in the FrameBuffer.
