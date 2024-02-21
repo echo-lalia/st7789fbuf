@@ -675,6 +675,22 @@ class ST7789:
         if self.needs_swap:
             color = swap_bytes(color)
         self.fbuf.rect(x,y,w,h,color,fill)
+        
+    def ellipse(self, x, y, xr, yr, color, fill=False):
+        """
+        Draw an ellipse at the given location, radius and color.
+
+        Args:
+            x (int): Center x coordinate
+            y (int): Center y coordinate
+            xr (int): x axis radius
+            yr (int): y axis radius
+            color (int): 565 encoded color
+            fill (bool): fill in the ellipse. Default is False
+        """
+        if self.needs_swap:
+            color = swap_bytes(color)
+        self.fbuf.ellipse(x,y,xr,yr,color,fill)
 
     def fill_rect(self, x, y, width, height, color):
         """
