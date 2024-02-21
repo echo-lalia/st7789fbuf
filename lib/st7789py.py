@@ -1,6 +1,8 @@
 """
 MIT License
 
+Copyright (c) 2024 Ethan Lacasse
+
 Copyright (c) 2020-2023 Russ Hughes
 
 Copyright (c) 2019 Ivan Belokobylskiy
@@ -23,8 +25,14 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-The driver is based on devbis' st7789py_mpy module from
+The driver is based on russhughes' st7789py_mpy module from
+https://github.com/russhughes/st7789py_mpy, which is based on
 https://github.com/devbis/st7789py_mpy.
+
+This driver has been modified to use the fast MicroPython framebuf module as much as possible.
+Specifically, it has been made for MicroHydra on the Cardputer
+
+This module will use a lot more ram than the original, but it should be much faster too.
 
 This driver supports:
 
@@ -50,7 +58,8 @@ This driver supports:
 
 """
 
-from math import sin, cos
+from math import sin, cos, floor, pi, sqrt, pow
+import framebuf, struct, array
 
 #
 # This allows sphinx to build the docs
@@ -78,7 +87,7 @@ except ImportError:
 # here and the comment above except for the "from time import sleep_ms" line.
 #
 
-import struct
+
 
 # ST7789 commands
 _ST7789_SWRESET = b"\x01"
@@ -223,6 +232,126 @@ def color565(red, green=0, blue=0):
         red, green, blue = red[:3]
     return (red & 0xF8) << 8 | (green & 0xFC) << 3 | blue >> 3
 
+def swap_bytes(color):
+    """
+    this just flips the left and right byte in the 16 bit color.
+    """
+    return ((color & 255) << 8) + (color >> 8) 
+
+def scale_poly(points, scale=1.2):
+    """
+    Resize all the points in the array. Returns None.
+    """
+    for idx, point in enumerate(points):
+        points[idx] = floor(point * scale)
+
+def rotate_points(points, angle=0, center_x=0, center_y=0):
+    """
+    Rotate all the points in the array, return resulting array.
+    """
+    if angle:
+        cos_a = cos(angle)
+        sin_a = sin(angle)
+        rotated = array.array('h')
+        for i in range(0,len(points),2):
+            rotated.append(
+                center_x + floor((points[i] - center_x) * cos_a - (points[i+1] - center_y) * sin_a)
+            )
+            rotated.append(
+                center_y + floor((points[i] - center_x) * sin_a + (points[i+1] - center_y) * cos_a)    
+            )
+        return rotated
+    else:
+        return points
+
+def warp_points(points, tilt_center=0.5, ease=True, focus_center_x=True, smallest=None, largest=None):
+    """
+    Skew points on the y axis. Can create a faux 3d looking effect, or a kinda jelly-like effect.
+    """
+    if tilt_center == 0.5 and not ease:
+        return points
+    
+    if smallest == None:
+        smallest = min(points)
+    if largest == None:
+        largest = max(points)
+
+    midpoint = (smallest + largest) / 2
+    #shift numbers so that the smallest point = 0
+    adj_largest = largest - smallest
+    adj_midpoint = adj_largest / 2
+    new_adj_midpoint = adj_largest * tilt_center
+    
+    #shift largest down, (along with newmidpoint), so that newmidpoint = 0
+    #this is done so that we can interpolate between 0 and this number, then re-add the midpoint
+    temp_largest = adj_largest - new_adj_midpoint
+    
+    #iterate over each point
+    # if point is less than midpoint, interpolate point between 0 and new midpoint
+    # if point is greater than midpoint, interpolate between new midpoint and largest
+    # then add the smallest value back to the result, to shift the result into the original range
+    #for index, point in enumerate(points):
+    for index in range(1,len(points),2):
+        point=points[index]
+        
+        if focus_center_x:
+            #if focus_center_x, then apply the effect more strongly to points nearer to the center x
+            adj_x_val = points[index-1] - smallest
+            x_center_factor = abs(adj_x_val - adj_midpoint ) / adj_midpoint
+            x_center_factor = ease_in_out_circ(x_center_factor)
+        
+        if point < midpoint:
+            #find fac between 0 and adj_midpoint,
+            #then interpolate between 0 and new midpoint
+            adj_point = point - smallest
+            factor = adj_point / adj_midpoint
+            
+            #fancy easing function to round out the shape more
+            factor = ease_in_out_sine(factor)
+            
+            if focus_center_x:
+                points[index] = floor(
+                    mix(
+                        (new_adj_midpoint * factor) + smallest, points[index], x_center_factor
+                        ))
+            else:
+                points[index] = floor((new_adj_midpoint * factor) + smallest)
+
+
+        else: # point >= midpoint:
+            #find fac between adj_midpoint and adj_largest,
+            #then interpolate between new midpoint and largest
+            adj_point = point - smallest
+            factor = (adj_point - adj_midpoint) / (adj_largest - adj_midpoint)
+            
+            #fancy easing function to round out the shape more
+            factor = ease_in_out_sine(factor)
+            
+            if focus_center_x:
+                points[index] = floor(
+                    mix(
+                        (temp_largest * factor) + new_adj_midpoint + smallest,points[index],x_center_factor
+                        )
+                    )
+            else:
+                points[index] = floor((temp_largest * factor) + new_adj_midpoint + smallest)       
+            
+    return points
+
+def mix(val2, val1, fac=0.5):
+    """Mix two values to the weight of fac"""
+    output = (val1 * fac) + (val2 * (1.0 - fac))
+    return output
+
+
+def ease_in_out_sine(x):
+    return -(cos(pi * x) - 1) / 2
+
+def ease_in_out_circ(x):
+    if x < 0.5:
+        return (1 - sqrt(1 - pow(2 * x, 2))) / 2
+    else:
+        return (sqrt(1 - pow(-2 * x + 2, 2)) + 1) / 2
 
 class ST7789:
     """
@@ -286,7 +415,13 @@ class ST7789:
 
         if dc is None:
             raise ValueError("dc pin is required.")
-
+        
+        #init the fbuf
+        if rotation == 1 or rotation == 3:
+            self.fbuf = framebuf.FrameBuffer(bytearray(height*width*2), height, width, framebuf.RGB565)
+        else:
+            self.fbuf = framebuf.FrameBuffer(bytearray(height*width*2), width, height, framebuf.RGB565)
+        
         self.physical_width = self.width = width
         self.physical_height = self.height = height
         self.xstart = 0
@@ -304,7 +439,7 @@ class ST7789:
         self.init(self.init_cmds)
         self.init(self.init_cmds)
         self.rotation(self._rotation)
-        self.needs_swap = False
+        self.needs_swap = True
         self.fill(0x0)
 
         if backlight is not None:
@@ -451,7 +586,9 @@ class ST7789:
             length (int): length of line
             color (int): 565 encoded color
         """
-        self.fill_rect(x, y, 1, length, color)
+        if self.needs_swap:
+            color = swap_bytes(color)
+        self.fbuf.vline(x, y, length, color)
 
     def hline(self, x, y, length, color):
         """
@@ -463,7 +600,9 @@ class ST7789:
             length (int): length of line
             color (int): 565 encoded color
         """
-        self.fill_rect(x, y, length, 1, color)
+        if self.needs_swap:
+            color = swap_bytes(color)
+        self.fbuf.hline(x, y, length, color)
 
     def pixel(self, x, y, color):
         """
@@ -474,17 +613,22 @@ class ST7789:
             Y (int): y coordinate
             color (int): 565 encoded color
         """
-        self._set_window(x, y, x, y)
-        self._write(
-            None,
-            struct.pack(
-                _ENCODE_PIXEL_SWAPPED if self.needs_swap else _ENCODE_PIXEL, color
-            ),
-        )
-
-    def blit_buffer(self, buffer, x, y, width, height):
+        if self.needs_swap:
+            color = swap_bytes(color)
+        self.fbuf.pixel(x,y,color)
+        
+        
+    def show(self):
         """
-        Copy buffer to display at the given location.
+        Write the current framebuf to the display
+        """
+        self._set_window(0, 0, self.width - 1, self.height - 1)
+        self._write(None, self.fbuf)
+        
+        
+    def blit_buffer(self, buffer, x, y, width, height, key=-1, palette=None):
+        """
+        Copy buffer to display framebuf at the given location.
 
         Args:
             buffer (bytes): Data to copy to display
@@ -492,11 +636,32 @@ class ST7789:
             Y (int): Top left corner y coordinate
             width (int): Width
             height (int): Height
+            key (int): color to be considered transparent
+            palette (framebuf): the color pallete to use for the buffer
         """
-        self._set_window(x, y, x + width - 1, y + height - 1)
-        self._write(None, buffer)
+        self.fbuf.blit(framebuf.FrameBuffer(buffer,width, height, framebuf.RGB565), x,y,key,palette)
+        
+    def blit_framebuf(self, fbuf, x, y, key=-1, palette=None):
+        """
+        Copy FrameBuffer to internal FrameBuffer at the given location.
+        
+        This is an alternate version of blit_buffer,
+        which does not create a new framebuffer on use.
+        This can be useful for reusing a framebuffer multiple times.
 
-    def rect(self, x, y, w, h, color):
+        Args:
+            fbuf (bytes): Data to copy to display
+            x (int): Top left corner x coordinate
+            Y (int): Top left corner y coordinate
+            width (int): Width
+            height (int): Height
+            buffer_format (framebuf format): the color format to use for the blit function. 
+            key (int): color to be considered transparent
+            palette (framebuf): the color pallete to use for the buffer
+        """
+        self.fbuf.blit(fbuf, x,y,key,palette)
+
+    def rect(self, x, y, w, h, color, fill=False):
         """
         Draw a rectangle at the given location, size and color.
 
@@ -507,14 +672,16 @@ class ST7789:
             height (int): Height in pixels
             color (int): 565 encoded color
         """
-        self.hline(x, y, w, color)
-        self.vline(x, y, h, color)
-        self.vline(x + w - 1, y, h, color)
-        self.hline(x, y + h - 1, w, color)
+        if self.needs_swap:
+            color = swap_bytes(color)
+        self.fbuf.rect(x,y,w,h,color,fill)
 
     def fill_rect(self, x, y, width, height, color):
         """
         Draw a rectangle at the given location, size and filled with color.
+        
+        This is just a wrapper for the rect() method,
+        and is provided for compatibility with the original st7789py driver.
 
         Args:
             x (int): Top left corner x coordinate
@@ -523,18 +690,7 @@ class ST7789:
             height (int): Height in pixels
             color (int): 565 encoded color
         """
-        self._set_window(x, y, x + width - 1, y + height - 1)
-        chunks, rest = divmod(width * height, _BUFFER_SIZE)
-        pixel = struct.pack(
-            _ENCODE_PIXEL_SWAPPED if self.needs_swap else _ENCODE_PIXEL, color
-        )
-        self.dc.on()
-        if chunks:
-            data = pixel * _BUFFER_SIZE
-            for _ in range(chunks):
-                self._write(None, data)
-        if rest:
-            self._write(None, pixel * rest)
+        self.rect(x, y, width, height, color, fill=True)
 
     def fill(self, color):
         """
@@ -543,7 +699,9 @@ class ST7789:
         Args:
             color (int): 565 encoded color
         """
-        self.fill_rect(0, 0, self.width, self.height, color)
+        if self.needs_swap:
+            color = swap_bytes(color)
+        self.fbuf.fill(color)
 
     def line(self, x0, y0, x1, y1, color):
         """
@@ -556,27 +714,7 @@ class ST7789:
             y1 (int): End point y coordinate
             color (int): 565 encoded color
         """
-        steep = abs(y1 - y0) > abs(x1 - x0)
-        if steep:
-            x0, y0 = y0, x0
-            x1, y1 = y1, x1
-        if x0 > x1:
-            x0, x1 = x1, x0
-            y0, y1 = y1, y0
-        dx = x1 - x0
-        dy = abs(y1 - y0)
-        err = dx // 2
-        ystep = 1 if y0 < y1 else -1
-        while x0 <= x1:
-            if steep:
-                self.pixel(y0, x0, color)
-            else:
-                self.pixel(x0, y0, color)
-            err -= dy
-            if err < 0:
-                y0 += ystep
-                err += dx
-            x0 += 1
+        self.fbuf.line(x0, y0, x1, y1, color)
 
     def vscrdef(self, tfa, vsa, bfa):
         """
@@ -613,6 +751,17 @@ class ST7789:
 
         """
         self._write(_ST7789_VSCSAD, struct.pack(">H", vssa))
+
+    def scroll(xstep,ystep):
+        """
+        Shift the contents of the FrameBuffer by the given vector.
+        This may leave a footprint of the previous colors in the FrameBuffer.
+
+        Unlike vscsad which uses the hardware for scrolling,
+        this method scrolls the framebuffer itself.
+        This is a wrapper for the framebuffer.scroll method:
+        """
+        self.fbuf.scroll(xstep,ystep)
 
     @micropython.viper
     @staticmethod
@@ -678,7 +827,7 @@ class ST7789:
 
         return buffer
 
-    def _text8(self, font, text, x0, y0, fg_color=WHITE, bg_color=BLACK):
+    def _text8(self, font, text, x0, y0, fg_color=WHITE):
         """
         Internal method to write characters with width of 8 and
         heights of 8 or 16.
@@ -689,9 +838,12 @@ class ST7789:
             x0 (int): column to start drawing at
             y0 (int): row to start drawing at
             color (int): 565 encoded color to use for characters
-            background (int): 565 encoded color to use for background
         """
-
+        if fg_color == 0:
+            bg_color = 1
+        else:
+            bg_color = 0
+            
         for char in text:
             ch = ord(char)
             if (
@@ -711,11 +863,11 @@ class ST7789:
                 for line in range(passes):
                     idx = (ch - font.FIRST) * size + (each * line)
                     buffer = self._pack8(font.FONT, idx, fg_color, bg_color)
-                    self.blit_buffer(buffer, x0, y0 + 8 * line, 8, 8)
+                    self.blit_buffer(buffer, x0, y0 + 8 * line, 8, 8,key=bg_color)
 
                 x0 += 8
 
-    def _text16(self, font, text, x0, y0, fg_color=WHITE, bg_color=BLACK):
+    def _text16(self, font, text, x0, y0, fg_color=WHITE):
         """
         Internal method to draw characters with width of 16 and heights of 16
         or 32.
@@ -726,9 +878,11 @@ class ST7789:
             x0 (int): column to start drawing at
             y0 (int): row to start drawing at
             color (int): 565 encoded color to use for characters
-            background (int): 565 encoded color to use for background
         """
-
+        if fg_color == 0:
+            bg_color = 1
+        else:
+            bg_color = 0
         for char in text:
             ch = ord(char)
             if (
@@ -747,10 +901,26 @@ class ST7789:
                 for line in range(passes):
                     idx = (ch - font.FIRST) * size + (each * line)
                     buffer = self._pack16(font.FONT, idx, fg_color, bg_color)
-                    self.blit_buffer(buffer, x0, y0 + 8 * line, 16, 8)
+                    self.blit_buffer(buffer, x0, y0 + 8 * line, 16, 8,key=bg_color)
             x0 += 16
 
-    def text(self, font, text, x0, y0, color=WHITE, background=BLACK):
+    def text(self, text, x, y, color=WHITE):
+        """
+        Quickly draw text to the display using the FrameBuffer text method.
+        
+        This uses the font built into the FrameBuffer class, and so custom fonts are not supported.
+        
+        Args:
+            text (str): text to write
+            x (int): column to start drawing at
+            y (int): row to start drawing at
+            color (int): 565 encoded color to use for text
+        """
+        if self.needs_swap:
+            color = swap_bytes(color)
+        self.fbuf.text(text, x, y, color)
+
+    def bitmap_text(self, font, text, x0, y0, color=WHITE):
         """
         Draw text on display in specified font and colors. 8 and 16 bit wide
         fonts are supported.
@@ -761,21 +931,16 @@ class ST7789:
             x0 (int): column to start drawing at
             y0 (int): row to start drawing at
             color (int): 565 encoded color to use for characters
-            background (int): 565 encoded color to use for background
         """
-        fg_color = color if self.needs_swap else ((color << 8) & 0xFF00) | (color >> 8)
-        bg_color = (
-            background
-            if self.needs_swap
-            else ((background << 8) & 0xFF00) | (background >> 8)
-        )
+        if self.needs_swap:
+            color=swap_bytes(color)
 
         if font.WIDTH == 8:
-            self._text8(font, text, x0, y0, fg_color, bg_color)
+            self._text8(font, text, x0, y0, color)
         else:
-            self._text16(font, text, x0, y0, fg_color, bg_color)
+            self._text16(font, text, x0, y0, color)
 
-    def bitmap(self, bitmap, x, y, index=0):
+    def bitmap(self, bitmap, x, y, index=0, key=-1):
         """
         Draw a bitmap on display at the specified column and row
 
@@ -785,6 +950,7 @@ class ST7789:
             y (int): row to start drawing at
             index (int): Optional index of bitmap to draw from multiple bitmap
                 module
+            key (int): colors that match they key will be transparent.
         """
         width = bitmap.WIDTH
         height = bitmap.HEIGHT
@@ -798,7 +964,12 @@ class ST7789:
         bpp = bitmap.BPP
         bs_bit = bpp * bitmap_size * index  # if index > 0 else 0
         palette = bitmap.PALETTE
-        needs_swap = self.needs_swap
+        
+        #swap colors if needed:
+        if self.needs_swap:
+            for i in range(0,len(palette)):
+                palette[i] = swap_bytes(palette[i])
+        
         buffer = bytearray(buffer_len)
 
         for i in range(0, buffer_len, 2):
@@ -810,61 +981,113 @@ class ST7789:
                 bs_bit += 1
 
             color = palette[color_index]
-            if needs_swap:
-                buffer[i] = color & 0xFF
-                buffer[i + 1] = color >> 8
-            else:
-                buffer[i] = color >> 8
-                buffer[i + 1] = color & 0xFF
 
-        self._set_window(x, y, to_col, to_row)
-        self._write(None, buffer)
+            buffer[i] = color & 0xFF
+            buffer[i + 1] = color >> 8
+        
+        self.blit_buffer(buffer,x,y,width,height,key=key)
+        #self._set_window(x, y, to_col, to_row)
+        #self._write(None, buffer)
 
-    def pbitmap(self, bitmap, x, y, index=0):
+    def bitmap_icons(self, bitmap_module, bitmap, color, x, y, invert_colors=False):
         """
-        Draw a bitmap on display at the specified column and row one row at a time
+        Draw a 2 color bitmap as a transparent icon on display,
+        at the specified column and row, using given color and memoryview object.
+        
+        This function was particularly designed for use with MicroHydra Launcher,
+        but could probably be useful elsewhere too.
 
         Args:
-            bitmap (bitmap_module): The module containing the bitmap to draw
+            (bitmap_module): The module containing the bitmap to draw
+            bitmap: The actual bitmap buffer to draw
+            color: the non-transparent color of the bitmap
             x (int): column to start drawing at
             y (int): row to start drawing at
-            index (int): Optional index of bitmap to draw from multiple bitmap
-                module
-
+            invert_colors (bool): flip transparent and non-tranparent parts of bitmap.
+            
         """
-        width = bitmap.WIDTH
-        height = bitmap.HEIGHT
+        width = bitmap_module.WIDTH
+        height = bitmap_module.HEIGHT
+        to_col = x + width - 1
+        to_row = y + height - 1
+        if self.width <= to_col or self.height <= to_row:
+            return
+
         bitmap_size = height * width
-        bpp = bitmap.BPP
-        bs_bit = bpp * bitmap_size * index  # if index > 0 else 0
-        palette = bitmap.PALETTE
+        buffer_len = bitmap_size * 2
+        bpp = bitmap_module.BPP
+        bs_bit = 0
         needs_swap = self.needs_swap
-        buffer = bytearray(bitmap.WIDTH * 2)
+        buffer = bytearray(buffer_len)
+        
+        if self.needs_swap:
+            color = swap_bytes(color)
+            
+        #prevent bg color from being invisible
+        if color == 0:
+            palette = (65535, color)
+        else:
+            palette = (0, color)
+        
+        for i in range(0, buffer_len, 2):
+            color_index = 0
+            for _ in range(bpp):
+                color_index = (color_index << 1) | (
+                    (bitmap[bs_bit >> 3] >> (7 - (bs_bit & 7))) & 1
+                )
+                bs_bit += 1
 
-        for row in range(height):
-            for col in range(width):
-                color_index = 0
-                for _ in range(bpp):
-                    color_index <<= 1
-                    color_index |= (
-                        bitmap.BITMAP[bs_bit // 8] & 1 << (7 - (bs_bit % 8))
-                    ) > 0
-                    bs_bit += 1
-                color = palette[color_index]
-                if needs_swap:
-                    buffer[col * 2] = color & 0xFF
-                    buffer[col * 2 + 1] = color >> 8 & 0xFF
-                else:
-                    buffer[col * 2] = color >> 8 & 0xFF
-                    buffer[col * 2 + 1] = color & 0xFF
+            color = palette[color_index]
 
-            to_col = x + width - 1
-            to_row = y + row
-            if self.width > to_col and self.height > to_row:
-                self._set_window(x, y + row, to_col, to_row)
-                self._write(None, buffer)
+            buffer[i] = color & 0xFF
+            buffer[i + 1] = color >> 8
 
-    def write(self, font, string, x, y, fg=WHITE, bg=BLACK):
+        
+        self.blit_buffer(buffer,x,y,width,height,key=palette[0])
+                
+            
+#     def write(self, font, string, x, y, fg=WHITE, bg=None):
+#         #key out bg when unspecified
+#         key=-1
+#         if bg==None:
+#             if fg == 0:
+#                 bg = 65535
+#                 key = 65535
+#             else:
+#                 bg = 0
+#                 key = 0
+#         buffer_len = font.HEIGHT * font.MAX_WIDTH * 2
+#         buffer = bytearray(buffer_len)
+#         fg_hi = fg >> 8
+#         fg_lo = fg & 0xFF
+#         bg_hi = bg >> 8
+#         bg_lo = bg & 0xFF
+#         for character in string:
+#             try:
+#                 char_index = font.MAP.index(character)
+#                 offset = char_index * font.OFFSET_WIDTH
+#                 bs_bit = font.OFFSETS[offset]
+#                 
+#                 if font.OFFSET_WIDTH > 2:
+#                     bs_bit = (bs_bit << 8) + font.OFFSETS[offset + 2]
+#                 elif font.OFFSET_WIDTH > 1:
+#                     bs_bit = (bs_bit << 8) + font.OFFSETS[offset + 1]
+#                 char_width = font.WIDTHS[char_index]
+#                 buffer_needed = char_width * font.HEIGHT * 2
+#                 for i in range(0, buffer_needed, 2):
+#                     if font.BITMAPS[bs_bit // 8] & 1 << (7 - (bs_bit % 8)) > 0:
+#                         buffer[i] = fg_hi
+#                         buffer[i + 1] = fg_lo
+#                     else:
+#                         buffer[i] = bg_hi
+#                         buffer[i + 1] = bg_lo
+#                     bs_bit += 1
+#                 self.blit_buffer(buffer,x,y,char_width,font.HEIGHT,key=key)
+#                 x += char_width
+#             except ValueError:
+#                 pass
+
+    def write(self, font, string, x, y, fg=WHITE):
         """
         Write a string using a converted true-type font on the display starting
         at the specified column and row
@@ -875,49 +1098,37 @@ class ST7789:
             x (int): column to start writing
             y (int): row to start writing
             fg (int): foreground color, optional, defaults to WHITE
-            bg (int): background color, optional, defaults to BLACK
+            bg (int): background color, optional, defaults to None
         """
-        buffer_len = font.HEIGHT * font.MAX_WIDTH * 2
-        buffer = bytearray(buffer_len)
-        fg_hi = fg >> 8
-        fg_lo = fg & 0xFF
-
-        bg_hi = bg >> 8
-        bg_lo = bg & 0xFF
-
+        if self.needs_swap:
+            fg = swap_bytes(fg)
+            
         for character in string:
             try:
                 char_index = font.MAP.index(character)
                 offset = char_index * font.OFFSET_WIDTH
                 bs_bit = font.OFFSETS[offset]
-                if font.OFFSET_WIDTH > 1:
-                    bs_bit = (bs_bit << 8) + font.OFFSETS[offset + 1]
-
+                
                 if font.OFFSET_WIDTH > 2:
                     bs_bit = (bs_bit << 8) + font.OFFSETS[offset + 2]
-
+                elif font.OFFSET_WIDTH > 1:
+                    bs_bit = (bs_bit << 8) + font.OFFSETS[offset + 1]
+                
                 char_width = font.WIDTHS[char_index]
-                buffer_needed = char_width * font.HEIGHT * 2
-
-                for i in range(0, buffer_needed, 2):
+                buffer_needed = char_width * font.HEIGHT
+                
+                for i in range(0, buffer_needed):
+                    px_x = x + ((i) % char_width)
+                    px_y = y + ((i) // char_width)
                     if font.BITMAPS[bs_bit // 8] & 1 << (7 - (bs_bit % 8)) > 0:
-                        buffer[i] = fg_hi
-                        buffer[i + 1] = fg_lo
-                    else:
-                        buffer[i] = bg_hi
-                        buffer[i + 1] = bg_lo
-
+                        self.fbuf.pixel(px_x,px_y,fg)
+                    
                     bs_bit += 1
-
-                to_col = x + char_width - 1
-                to_row = y + font.HEIGHT - 1
-                if self.width > to_col and self.height > to_row:
-                    self._set_window(x, y, to_col, to_row)
-                    self._write(None, buffer[:buffer_needed])
 
                 x += char_width
 
             except ValueError:
+                print("ValueError in write; probably because a char used doesn't exists in the font")
                 pass
 
     def write_width(self, font, string):
@@ -942,53 +1153,63 @@ class ST7789:
                 pass
 
         return width
-
-    @micropython.native
-    def polygon(self, points, x, y, color, angle=0, center_x=0, center_y=0):
+    
+    def simple_poly(self,points,x,y,color,fill=False):
         """
         Draw a polygon on the display.
 
         Args:
-            points (list): List of points to draw.
+            points (array('h')): Array of points to draw.
+            x (int): X-coordinate of the polygon's position.
+            y (int): Y-coordinate of the polygon's position.
+            color (int): 565 encoded color.
+        """
+        if self.needs_swap:
+            color = swap_bytes(color)
+        self.fbuf.poly(x,y,points,color,fill)
+    
+    
+    
+    def polygon(self, points, x, y, color, angle=0, center_x=None, center_y=None, scale=1, warp=None, fill=False):
+        """
+        Draw a polygon on the display.
+
+        Args:
+            points (array('h')): Array of points to draw.
             x (int): X-coordinate of the polygon's position.
             y (int): Y-coordinate of the polygon's position.
             color (int): 565 encoded color.
             angle (float): Rotation angle in radians (default: 0).
             center_x (int): X-coordinate of the rotation center (default: 0).
             center_y (int): Y-coordinate of the rotation center (default: 0).
-
-        Raises:
-            ValueError: If the polygon has less than 3 points.
         """
-        if len(points) < 3:
-            raise ValueError("Polygon must have at least 3 points.")
-
-        if angle:
-            cos_a = cos(angle)
-            sin_a = sin(angle)
-            rotated = [
-                (
-                    x
-                    + center_x
-                    + int(
-                        (point[0] - center_x) * cos_a - (point[1] - center_y) * sin_a
-                    ),
-                    y
-                    + center_y
-                    + int(
-                        (point[0] - center_x) * sin_a + (point[1] - center_y) * cos_a
-                    ),
-                )
-                for point in points
-            ]
+        
+        #simple poly wrapper
+        if angle == 0 and scale == 1 and warp == None:
+            self.fbuf.poly(x,y,points,color,fill)
+        
+        #complex polygon
         else:
-            rotated = [(x + int((point[0])), y + int((point[1]))) for point in points]
+            if self.needs_swap:
+                color = swap_bytes(color)
+            #clone array so we don't modify original
+            points = array.array('h',points)
+            
+            #scale
+            if scale != 1:
+                scale_poly(points,scale)
+            
+            if center_x == None:
+                center_x = max(points) // 2
+            if center_y == None:
+                center_y = max(points) // 2
+            
+            #rotate
+            if angle != 0:
+                points = rotate_points(points, angle, center_x, center_y)
+                
+            if warp != None:
+                warp_points(points, warp)
+            
+            self.fbuf.poly(x,y,points,color,fill)
 
-        for i in range(1, len(rotated)):
-            self.line(
-                rotated[i - 1][0],
-                rotated[i - 1][1],
-                rotated[i][0],
-                rotated[i][1],
-                color,
-            )
