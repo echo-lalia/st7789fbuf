@@ -1,8 +1,13 @@
 MicroPython LCD Driver in Python
 ================================
 
-This is a fork of devbis' st7789py_mpy module from
-https://github.com/devbis/st7789py_mpy.
+This is a work-in-progress fork of russhughes' st7789py_mpy module from
+https://github.com/russhughes/st7789py_mpy.
+
+This fork has been modified to use the MicroPython FrameBuffer class for speed. 
+The results are much faster than the original version of this driver, however the framebuffer does use a large chunk of ram, so it's not a straight upgrade.
+
+I have tried to keep support for all the same displays as the original driver did, however, I have only tested this version on am M5 Cardputer *(240x135, rotation=1, GRB color)*, and so it's likely that further modifications will need to be made to fully support other display configurations. 
 
 This driver has support for:
 
@@ -12,7 +17,10 @@ This driver has support for:
 - Hardware based scrolling
 - Drawing text using converted PC BIOS bitmap fonts
 - Drawing text using converted TrueType fonts.
+- Drawing text using the built-in framebuf font.
 - Drawing converted bitmaps
+- Drawing ellipses
+- Drawing and deforming polygons
 
 This is a work in progress. Documentation can be found in the docs directory
 and at https://russhughes.github.io/st7789py_mpy/
