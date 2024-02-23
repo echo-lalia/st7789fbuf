@@ -9,12 +9,19 @@ The results are much faster than the original version of this driver, however th
 
 I have tried to keep support for all the same displays as the original driver did, however, I have only tested this version on am M5 Cardputer *(240x135, rotation=1, GRB color)*, and so it's likely that further modifications will need to be made to fully support other display configurations. 
 
+<br/>
+
+-----
+
+<br/>
+
 This driver has support for:
 
 - 320x240, 240x240, 135x240, and 128x128 pixel and other displays
 - RGB and BGR Color Orders
 - Display rotation
 - Hardware based scrolling
+- Software based scrolling
 - Drawing text using converted PC BIOS bitmap fonts
 - Drawing text using converted TrueType fonts.
 - Drawing text using the built-in framebuf font.
