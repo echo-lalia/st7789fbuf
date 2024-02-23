@@ -1202,6 +1202,8 @@ class ST7789:
         
         #simple poly wrapper
         if angle == 0 and scale == 1 and warp == None:
+            if self.needs_swap:
+                color = swap_bytes(color)
             self.fbuf.poly(x,y,points,color,fill)
         
         #complex polygon
